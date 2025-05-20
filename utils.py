@@ -287,3 +287,153 @@ def eval_model_experts_prompt_based(
     data_dict["final_test_acc"] /= len(classified_samples)
 
     return data_dict
+
+def eval_model_experts_prompt_based_enhanced(  
+    vllm_model,  
+    evaluator,  
+    experts_path_dict,  
+    policy,  
+    model,  
+    base_params,  
+    decomposed_params,  
+    task_metric,  
+    use_enhanced_merging=True,  
+):  
+    """拡張された専門知識ベクトルマージを使用したモデル評価"""  
+    results_by_expert = {}  
+    
+    # サンプルの分類  
+    classified_samples = classify_samples(vllm_model, evaluator)  
+    
+    # 分類結果の分析と重み付け係数の計算  
+    expert_weights = {}  
+    for expert_label in experts_path_dict.keys():  
+        # この専門家に分類されたサンプル数  
+        expert_samples = [s for s in classified_samples if s.expert_label == expert_label]  
+        if not expert_samples:  
+            expert_weights[expert_label] = 0.0  
+            continue  
+        
+        # サンプル数に基づく重み付け（他の方法も可能）  
+        expert_weights[expert_label] = len(expert_samples) / len(classified_samples)  
+    
+    # 専門知識ベクトルを読み込む  
+    experts_params = {}  
+    for expert_label, expert_path in experts_path_dict.items():  
+        if not expert_path or expert_weights[expert_label] <= 0:  
+            continue  
+        
+        # 専門知識ベクトルのロード  
+        policy.load_state_dict(torch.load(expert_path))  
+        experts_params[expert_label] = policy.get_learnable_params()  
+    
+    # 拡張されたマージ関数を使用  
+    if use_enhanced_merging and len(experts_params) > 1:  
+        merged_params = merge_expert_vectors(  
+            experts_params,   
+            expert_weights,  
+            decomposed_params,  
+            similarity_threshold=0.8,  
+            adaptive_scaling=True  
+        )  
+        
+        # マージされたパラメータを使用してモデルを更新  
+        updated_params = {}  
+        for k in base_params:  
+            if "mlp" in k and k in merged_params:  
+                updated_params[k] = compose_new_params_enhanced(  
+                    policy=policy,  
+                    param_name=k,  
+                    decomposed_params=decomposed_params,  
+                    learnable_params=merged_params,  
+                )  
+            else:  
+                updated_params[k] = base_params[k]  
+        
+        # VLLMモデルに更新されたパラメータをロード  
+        load_hf_params_to_vllm(updated_params, vllm_model.llm)  
+        
+        # モデルを評価  
+        evaluation_results = eval_model(vllm_model, evaluator)  
+        results_by_expert["merged"] = {  
+            "num_samples": len(classified_samples),  
+            "test_acc": evaluation_results.aggregate_metrics[task_metric],  
+        }  
+    
+    # 結果の計算と返却  
+    data_dict = results_by_expert.copy()  
+    data_dict["expert_weights"] = expert_weights  
+    data_dict["final_test_acc"] = results_by_expert.get("merged", {"test_acc": 0})["test_acc"]  
+    
+    return data_dict
+
+def compose_new_params_enhanced(  
+    policy,  
+    param_name,  
+    decomposed_params,  
+    learnable_params,  
+    task_specific_scaling=None,  
+):  
+    """拡張されたパラメータ合成関数"""  
+    mm = policy.get_mask(learnable_params[param_name])  
+
+    # タスク特有のスケーリングがある場合は適用  
+    if task_specific_scaling is not None:  
+        mm = mm * task_specific_scaling.get(param_name, 1.0)  
+
+    # SVD成分の合成と正規化  
+    composed_param = (  
+        decomposed_params[f"{param_name}.U"]  
+        @ torch.diag_embed(decomposed_params[f"{param_name}.S"] * mm)  
+        @ decomposed_params[f"{param_name}.V"].T  
+    )  
+    
+    # 正規化係数の計算  
+    original_sum = decomposed_params[f"{param_name}.S"].sum()  
+    modified_sum = (decomposed_params[f"{param_name}.S"] * mm).sum()  
+    
+    # より安定した正規化（ゼロ除算を防ぐ）  
+    scaling_factor = original_sum / (modified_sum + 1e-6)  
+    
+    return composed_param * scaling_factor
+
+@torch.no_grad()  
+def merge_expert_vectors(  
+    experts_dict,  
+    weights_dict,  
+    decomposed_params,  
+    similarity_threshold=0.7,  
+    adaptive_scaling=True,  
+):  
+    """複数の専門知識ベクトルをマージして最適化する関数"""  
+    merged_params = {}  
+    
+    # パラメータキーに対してループ  
+    for param_key in list(experts_dict.values())[0].keys():  
+        # 各エキスパートからのマスク値を収集  
+        expert_masks = []  
+        for expert_name, expert_params in experts_dict.items():  
+            weight = weights_dict.get(expert_name, 1.0)  
+            expert_masks.append(weight * expert_params[param_key])  
+        
+        # 類似度に基づくクラスタリングとマージ  
+        if similarity_threshold < 1.0:  
+            # ここに類似度ベースのクラスタリングを実装  
+            # 類似した専門知識ベクトルをグループ化  
+            pass  
+        
+        # マスク値の結合（単純な加重平均ではなく、パラメータごとに最適なマスク値を選択）  
+        if adaptive_scaling:  
+            # より高度なマージロジック（例：最大値を取る、特定パターンを優先する等）  
+            merged_mask = torch.stack(expert_masks).max(dim=0).values  
+        else:  
+            # 従来の加重平均方式  
+            merged_mask = torch.zeros_like(expert_masks[0])  
+            for mask in expert_masks:  
+                merged_mask += mask  
+            merged_mask /= len(expert_masks)  
+        
+        # マージされたマスクを使って新しいパラメータを合成  
+        merged_params[param_key] = merged_mask  
+    
+    return merged_params

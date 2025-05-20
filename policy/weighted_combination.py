@@ -136,3 +136,48 @@ class WeightedCombination(Policy):
             for i, w in enumerate(avg_weights.tolist())
         }
         metrics_to_log.update(**dict_to_log)
+
+class AdaptiveWeightedCombination(WeightedCombination):
+    def __init__(
+            self,  
+            base_policy_cfg,  
+            params_paths,  
+            gpu,  
+            norm_coeffs,  
+            per_layer,  
+            context_adaptation=True,  
+            init_values=None,  
+            **kwargs, 
+        ):
+        # コンテキスト適応のためのパラメーター追加
+        super().__init__(
+            base_policy_cfg=base_policy_cfg,
+            params_paths=params_paths,
+            gpu=gpu,
+            norm_coeffs=norm_coeffs,
+            per_layer=per_layer,
+            init_values=init_values,
+            **kwargs
+        )
+        self.context_adaptation = context_adaptation  
+        if context_adaptation:  
+            # コンテキスト情報に基づいてベクトル重みを動的に調整するパラメータ  
+            self.context_weights = torch.nn.Parameter(  
+                data=torch.zeros(self.num_weights_dict, self.learned_params_per_weight_dict),  
+                requires_grad=True,  
+            )  
+            self.trainable_params.append(self.context_weights)
+
+    def update_context_weights(self, context_features):
+        # コンテキスト情報に基づいてベクトル重みを更新するメソッド
+        # context_infoはコンテキスト情報を表すベクトル
+        # ここでは簡単にcontext_infoをベクトル重みに乗算する例を示す
+        # ここではcontext_infoをベクトル重みに乗算する例を示す
+        # TODO:実際のコンテキスト適応はコンテキスト情報に応じてより複雑な更新を行う
+        context_influence = torch.sigmoid(self.context_weights)  
+        self.adaptive_weights = self.adaptive_weights * (1 + 0.2 * context_influence)  
+
+    def get_coeff_per_layer(self):
+        # コンテキスト適応を含む重みを計算
+        weights_per_layer = super().get_coeff_per_layer()
+        return weights_per_layer * self.context_weights
